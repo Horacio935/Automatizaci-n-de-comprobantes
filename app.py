@@ -4,48 +4,102 @@ import streamlit as st
 import pandas as pd
 import streamlit.components.v1 as components
 
+
 # --------------------------------------------------------------------
 #  Funciones auxiliares
 # --------------------------------------------------------------------
 
 def cargar_planilla(archivo_excel: io.BytesIO) -> pd.DataFrame:
     """
-    Detecta automáticamente la hoja que empieza con 'PLANILLA SECT'
-    y la carga aunque el sector sea diferente.
+    Carga la plantilla de planillas (formato nuevo),
+    detecta nombres modificados como 'No.' y normaliza columnas clave.
     """
-    # Obtener lista de hojas del archivo
-    xls = pd.ExcelFile(archivo_excel)
-    hojas = xls.sheet_names
 
-    # Buscar hoja que empiece con 'PLANILLA SECT'
-    hoja_encontrada = None
-    for h in hojas:
+    # Cargar archivo y buscar hoja que empiece con "PLANILLA SECT"
+    xls = pd.ExcelFile(archivo_excel)
+    hoja = None
+    for h in xls.sheet_names:
         if str(h).strip().upper().startswith("PLANILLA SECT"):
-            hoja_encontrada = h
+            hoja = h
             break
 
-    if hoja_encontrada is None:
-        raise ValueError("No se encontró ninguna hoja que empiece con 'PLANILLA SECT'.")
+    if hoja is None:
+        raise ValueError("No se encontró una hoja que empiece con 'PLANILLA SECT'.")
 
-    # Cargar la hoja encontrada
-    df = pd.read_excel(
-        archivo_excel,
-        sheet_name=hoja_encontrada,
-        header=5  # misma estructura
-    )
+    # Leer encabezados en fila 6 (header=5)
+    df = pd.read_excel(archivo_excel, sheet_name=hoja, header=5)
 
-    # Filtrar solo filas válidas
-    df = df[df["Corr"].notna()].copy()
-    df = df[df["NOMBRE DEL EMPLEADO"].notna()]
-    df = df[df["NOMBRE DEL EMPLEADO"].astype(str).str.strip() != "nan"]
-    df = df[df["NOMBRE DEL EMPLEADO"].astype(str).str.strip() != ""]
+    # --- Normalización de columnas ---
+    mapping = {}
+    for col in df.columns:
+        col_clean = str(col).strip().upper()
+        col_clean_simple = " ".join(col_clean.split())  # quita dobles espacios
 
-    # Limpieza
+        # convertir No., NO, Nº etc en Corr
+        if col_clean in ["NO.", "NO", "Nº", "NUMERO", "#"]:
+            mapping[col] = "Corr"
+
+        # nombre del empleado con o sin espacios
+        elif col_clean.startswith("NOMBRE DEL EMPLEADO"):
+            mapping[col] = "NOMBRE DEL EMPLEADO"
+
+        # instalacion
+        elif col_clean.startswith("NOMBRE DE LA INSTALACION"):
+            mapping[col] = "NOMBRE DE LA INSTALACION"
+
+        # dias laborados
+        elif col_clean.startswith("DIAS LABOR"):
+            mapping[col] = "DIAS LABORADOS"
+
+        # salario base mensual (nuevo: SALARIO MENSUAL)
+        elif col_clean_simple.startswith("SALARIO BASE MENSUAL") or col_clean_simple == "SALARIO MENSUAL":
+            mapping[col] = "SALARIO BASE MENSUAL"
+
+        # sueldo según dias trabajados
+        elif col_clean_simple.startswith("SUELDO BASE SEG") or col_clean_simple.startswith("SUELDO SEGÚN DIAS TRABAJADOS"):
+            mapping[col] = "SUELDO BASE SEGÚN DIAS TRABAJADOS"
+
+        # total ingresos (nuevo: TOTAL  INGRESOS)
+        elif col_clean_simple.startswith("TOTAL OTROS INGRESOS") or col_clean_simple.startswith("TOTAL INGRESOS"):
+            # lo usamos como TOTAL OTROS INGRESOS porque ahi viene el total de ingresos
+            mapping[col] = "TOTAL OTROS INGRESOS"
+
+        # total egresos
+        elif col_clean_simple.startswith("TOTAL EGRESOS"):
+            mapping[col] = "TOTAL EGRESOS"
+
+        # liquido / total a recibir
+        elif col_clean_simple.startswith("TOTAL A RECIBIR") or col_clean_simple.startswith("LIQUIDO A RECIBIR"):
+            mapping[col] = "TOTAL A RECIBIR"
+
+    # aplicar mapeo
+    df = df.rename(columns=mapping)
+
+    # --- Verificación mínima ---
+    requeridas = [
+        "Corr",
+        "NOMBRE DEL EMPLEADO",
+        "NOMBRE DE LA INSTALACION",
+        "DIAS LABORADOS",
+        "SALARIO BASE MENSUAL",
+        "SUELDO BASE SEGÚN DIAS TRABAJADOS",
+        "TOTAL OTROS INGRESOS",
+        "TOTAL EGRESOS",
+        "TOTAL A RECIBIR",
+    ]
+
+    faltan = [c for c in requeridas if c not in df.columns]
+    if faltan:
+        raise ValueError("Faltan columnas obligatorias: " + ", ".join(faltan))
+
+    # --- Limpieza de filas ---
+    df = df[df["Corr"].notna()]
     df["Corr"] = df["Corr"].astype(int)
+
+    df = df[df["NOMBRE DEL EMPLEADO"].notna()]
     df["NOMBRE DEL EMPLEADO"] = df["NOMBRE DEL EMPLEADO"].astype(str).str.strip()
 
     return df
-
 
 def safe_float(value):
     try:
@@ -110,8 +164,13 @@ def fila_a_diccionario(row: pd.Series, periodo_texto: str) -> dict:
 
 
 def formato_moneda(valor: float) -> str:
-    """Devuelve el numero formateado como Q#.## con dos decimales."""
-    return f"Q {valor:,.2f}"
+    """
+    Devuelve el numero formateado con la moneda seleccionada por el usuario
+    (Q o $) y dos decimales.
+    """
+    simbolo = st.session_state.get("moneda", "Q")
+    return f"{simbolo} {valor:,.2f}"
+
 
 
 def renderizar_comprobante(datos: dict) -> str:
@@ -233,7 +292,7 @@ def renderizar_comprobante(datos: dict) -> str:
                     <td class="right">{f(datos["bono_puesto"])}</td>
                 </tr>
                 <tr>
-                    <td>Bono por trabajo / productividad</td>
+                    <td>Bonificacion Incentiva DEC 78-89</td>
                     <td class="right">{f(datos["bono_trabajo"])}</td>
                 </tr>
                 <tr>
@@ -333,6 +392,14 @@ if archivo is not None:
             "Texto del periodo (aparece en el comprobante)",
             value="DEL 01 AL 15 DE NOVIEMBRE DE 2025"
         )
+
+        # Selector de moneda (Q o $)
+        moneda = st.selectbox(
+            "Moneda del comprobante",
+            options=["Q", "$"],
+            index=0
+        )
+        st.session_state["moneda"] = moneda
 
         nombres = df["NOMBRE DEL EMPLEADO"].tolist()
         nombre_sel = st.selectbox("Selecciona un empleado", nombres)
